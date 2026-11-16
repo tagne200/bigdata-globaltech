@@ -1,39 +1,94 @@
-# bigdata-globaltech
+# Squelette projet Big Data : GlobalTech Industries
 
-Prototype de plateforme Big Data pour GlobalTech Industries : collecte, nettoyage, historisation et analyse des données logistiques et industrielles sur **Hadoop (HDFS, YARN)** et **Apache Spark 3.5**, en conteneurs **Docker**.
+Le code initial ne contient volontairement pas la solution. Objectif : ingestion, couches bronze / silver / gold, analyses batch, streaming capteurs (voir l'énoncé).
 
-**Équipe** : TAMO FOTSO Michel Darryl, TAGNE Kenneth Nathan, NGO NGWA Suzanne.
+## Données
 
-## Architecture
+Les données sont livrées en trois fois, aux jalons **J1, J2 et J3**. Elles sont produites par un générateur à graine fixe : un même jour livré deux fois est strictement identique (utile pour tester le rejeu sans doublon).
 
-Sources (commandes, produits, clients, logs web, capteurs) → **bronze** (Parquet brut) → **silver** (typé, contrôlé, SCD2, pseudonymisé) → **gold** (modèle en étoile, indicateurs), avec une table de **rejets** et une table d'**audit**. Les capteurs passent par un dossier d'atterrissage lu en Structured Streaming.
+`data/echantillon/J1/` contient un **petit échantillon** (100 000 commandes) de même structure que les vraies livraisons, pour développer en local en attendant J1. Les volumes réels sont d'environ 4 millions de commandes par livraison.
 
-Le détail est dans le document de cadrage (lot 0).
+Les anomalies ne sont pas listées : à vous de les découvrir, de les mesurer et de les traiter.
 
-## Arborescence
+### Organisation d'une livraison
 
-| Dossier | Contenu |
+```
+J1/
+  commandes/commandes_J1_part-0001.csv ...   en-tête répété dans chaque part
+  produits/produits_J1.csv
+  clients/clients_J1.csv
+  logs_web/access_J1_part-0001.log ...
+  capteurs/capteurs_20260131T080005.jsonl ... un fichier par tranche de 5 s
+```
+
+| Livraison | Commandes | Produits | Clients |
+|---|---|---|---|
+| J1 | janvier 2026 | historique complet des versions jusqu'au 31/01/2026 | extraction complète |
+| J2 | février 2026 | nouvelles versions uniquement (delta) | nouveaux clients et mises à jour (delta) |
+| J3 | mars 2026 | nouvelles versions uniquement (delta) | delta |
+
+### Dictionnaire des fichiers bruts
+
+**Commandes** (CSV, séparateur virgule, UTF-8)
+
+| Colonne | Description |
 |---|---|
-| `docker/` | Docker Compose du cluster et configuration Hadoop (lot 1) |
-| `src/bigdata/` | Code : `common`, `bronze`, `silver`, `gold`, `streaming`, `mapreduce` |
-| `conf/` | Configuration externalisée (`app.json`) |
-| `tests/` | Tests pytest |
-| `scripts/` | Scripts d'exploitation (smoke test, HDFS, simulation de panne) |
-| `tools/` | `stream_replay.py` fourni par l'enseignant |
-| `docs/` | ADR, architecture, runbook, dictionnaire, benchmark, fiche d'incident |
-| `data/` | Données fournies, **non versionnées** (voir ci-dessous) |
+| `order_id` | identifiant de commande |
+| `order_ts` | date et heure de commande, ISO 8601 sans fuseau, heure de Paris |
+| `customer_id` | identifiant client |
+| `product_id` | identifiant produit |
+| `quantity` | quantité commandée |
+| `unit_price_eur` | prix unitaire facturé (EUR), après remise éventuelle |
+| `country` | pays de livraison, code ISO 3166-1 alpha-2 |
+| `warehouse_id` | entrepôt expéditeur |
+| `channel` | `web`, `edi`, `commercial`, `partenaire` |
+| `status` | `COMPLETED`, `SHIPPED`, `CANCELLED`, `RETURNED` |
 
-## Démarrage
+Le schéma peut évoluer d'une livraison à l'autre.
 
-Les données ne sont pas dans Git : copiez l'échantillon fourni par l'enseignant dans `data/echantillon/J1/`.
+**Produits** (CSV) : une ligne = une version d'un produit.
 
-Le démarrage du cluster (moins de 10 minutes) sera décrit ici au lot 1, et les outils de vérification du code (tests, CI) au lot 8.
+| Colonne | Description |
+|---|---|
+| `product_id`, `product_name` | identifiant et libellé |
+| `family`, `category` | famille et catégorie (peuvent changer dans le temps) |
+| `unit_price_eur` | prix catalogue (EUR) |
+| `updated_at` | date à partir de laquelle la version s'applique |
+| `extracted_at` | date et heure de l'extraction depuis le système source |
 
-## Contribuer
+**Clients** (CSV, champs texte éventuellement entre guillemets) : `customer_id, company_name, contact_first_name, contact_last_name, email, phone, country, city, segment, created_at, updated_at`. Contient des **données personnelles**.
 
-Voir [CONTRIBUTING.md](CONTRIBUTING.md) : une branche par ticket Jira, une PR revue par un autre membre avant fusion.
+**Logs web** (texte) : format Apache *combined*, suivi du temps de réponse en millisecondes.
 
-## Documentation
+```
+203.0.113.12 - - [07/Jan/2026:14:21:03 +0100] "GET /catalogue/produit/P00042 HTTP/1.1" 200 5123 "-" "Mozilla/5.0 ..." 84
+```
 
-- [Kit et dictionnaire des fichiers bruts fournis par l'enseignant](docs/kit-enseignant.md)
-- [Modèle d'ADR](docs/adr/000-modele.md)
+**Capteurs** (JSON Lines) : `event_id, sensor_id, machine_id, site, country, metric, value, unit, event_time` (ISO 8601 avec fuseau). Le nom de fichier donne l'heure d'arrivée ; `event_time` donne l'heure de mesure.
+
+### Règles métier
+
+| Règle | Valeur |
+|---|---|
+| Fuseau horaire de référence | Europe/Paris |
+| Prix applicable | version produit en vigueur à `order_ts` (SCD type 2) |
+| Seuils d'alerte capteurs | température > 85 °C, vibration > 12 mm/s, pression > 8 bar |
+| Chiffre d'affaires | `quantity × unit_price_eur`, commandes non annulées |
+
+## Simuler le flux capteurs
+
+`tools/stream_replay.py` dépose un fichier toutes les 5 s dans un dossier d'atterrissage (dépôt atomique : Spark ne lit jamais un fichier à moitié copié).
+
+```bash
+# en local
+python tools/stream_replay.py --src data/echantillon/J1/capteurs --dest /tmp/landing/capteurs
+# vers HDFS, depuis un conteneur qui dispose de la commande hdfs
+python tools/stream_replay.py --src /opt/project/data/J1/capteurs --hdfs-dest /data/landing/capteurs
+# accéléré x10 ; reprise à partir du 200e fichier (test de reprise après arrêt)
+python tools/stream_replay.py --src ... --dest ... --speed 10 --start-at 200
+```
+
+## Remarques sur le squelette
+
+- `docker-compose.yml` lance Spark en mode *standalone*. Le lot 1 demande un cluster HDFS + YARN (NameNode, au moins 2 DataNodes, ResourceManager, NodeManagers, Spark History Server) : ce fichier est un point de départ à remplacer.
+- Les images `bitnami/*` ne sont plus publiées sur `docker.io/bitnami` depuis septembre 2025 : choisissez vos images et justifiez ce choix.
