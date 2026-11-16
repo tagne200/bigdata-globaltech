@@ -1,0 +1,8 @@
+{
+  "app_name": "bigdata-student-project",
+  "input_dir": "/opt/project/data/echantillon",
+  "delivery": "J1",
+  "landing_dir_capteurs": "/tmp/landing/capteurs",
+  "output_dir": "/opt/project/output",
+  "shuffle_partitions": 8
+}
