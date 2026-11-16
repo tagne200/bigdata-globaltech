@@ -1,5 +1,5 @@
 ## Ticket Jira
-BD-XX
+BG-XX
 
 ## Ce que fait cette PR
 -

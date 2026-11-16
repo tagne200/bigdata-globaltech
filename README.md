@@ -1,7 +1,5 @@
 # bigdata-globaltech
 
-![CI](https://github.com/tagne200/bigdata-globaltech/actions/workflows/ci.yml/badge.svg)
-
 Prototype de plateforme Big Data pour GlobalTech Industries : collecte, nettoyage, historisation et analyse des données logistiques et industrielles sur **Hadoop (HDFS, YARN)** et **Apache Spark 3.5**, en conteneurs **Docker**.
 
 **Équipe** : TAMO FOTSO Michel Darryl, TAGNE Kenneth Nathan, NGO NGWA Suzanne.
@@ -25,24 +23,15 @@ Le détail est dans le document de cadrage (lot 0).
 | `docs/` | ADR, architecture, runbook, dictionnaire, benchmark, fiche d'incident |
 | `data/` | Données fournies, **non versionnées** (voir ci-dessous) |
 
-## Démarrage en développement
+## Démarrage
 
-```bash
-python -m venv .venv
-# Windows : .venv\Scripts\activate   |   Linux/macOS : source .venv/bin/activate
-pip install -r requirements-dev.txt
-ruff check . && pytest
-```
+Les données ne sont pas dans Git : copiez l'échantillon fourni par l'enseignant dans `data/echantillon/J1/`.
 
-Java 17 doit être installé pour exécuter les tests Spark en local.
-
-Les données ne sont pas dans Git : copiez l'échantillon fourni dans `data/echantillon/J1/`.
-
-Le démarrage du cluster (moins de 10 minutes) sera décrit ici au lot 1.
+Le démarrage du cluster (moins de 10 minutes) sera décrit ici au lot 1, et les outils de vérification du code (tests, CI) au lot 8.
 
 ## Contribuer
 
-Voir [CONTRIBUTING.md](CONTRIBUTING.md) : une branche par ticket Jira, une PR revue par un autre membre, CI verte avant fusion.
+Voir [CONTRIBUTING.md](CONTRIBUTING.md) : une branche par ticket Jira, une PR revue par un autre membre avant fusion.
 
 ## Documentation
 
