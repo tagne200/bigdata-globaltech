@@ -1,1 +1,0 @@
-"""Couche gold."""

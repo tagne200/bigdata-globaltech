@@ -1,8 +1,5 @@
-# --- Données : jamais dans Git (fournies par l'enseignant, ~30 Mo par échantillon) ---
-data/echantillon/
-data/J1/
-data/J2/
-data/J3/
+# --- Données : jamais dans Git (fournies par l'enseignant) ---
+data/
 output/
 spark-warehouse/
 metastore_db/
@@ -26,6 +23,11 @@ venv/
 coverage.xml
 htmlcov/
 reports/
+
+# --- Fichiers générés par les assistants ---
+Claude outputs/
+_a_deplacer/
+_lot0/
 
 # --- Éditeurs et systèmes ---
 .vscode/

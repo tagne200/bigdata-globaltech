@@ -1,1 +1,0 @@
-"""Plateforme Big Data GlobalTech."""
