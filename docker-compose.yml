@@ -1,22 +1,148 @@
+# Cluster Hadoop + Spark du projet GlobalTech (lot 1 : BG-18, BG-19, BG-20).
+# Démarrage : docker compose up -d     Arrêt : docker compose down
+# Guide complet : docs/demarrage.md
+
+name: bigdata-globaltech
+
+# Réglages communs à tous les services Hadoop : même image, même configuration.
+x-hadoop: &hadoop
+  image: globaltech/hadoop-spark:3.5.0-3.5.3
+  build:
+    context: ./docker
+  env_file:
+    - ./docker/hadoop.env
+  restart: unless-stopped
+
 services:
-  spark-master:
-    image: bitnami/spark:3.5
+  # ---------- HDFS (stockage) ----------
+  namenode:
+    <<: *hadoop
+    hostname: namenode
+    command: ["hdfs", "namenode"]
     environment:
-      - SPARK_MODE=master
+      ENSURE_NAMENODE_DIR: /data/hdfs/namenode   # formate HDFS au tout premier démarrage
+      HADOOP_HEAPSIZE_MAX: 512m
     ports:
-      - "8080:8080"
-      - "7077:7077"
+      - "9870:9870"   # interface web HDFS
     volumes:
-      - ./data:/opt/project/data
-      - ./src:/opt/project/src
-      - ./conf:/opt/project/conf
-  spark-worker:
-    image: bitnami/spark:3.5
-    depends_on: [spark-master]
+      - namenode:/data/hdfs
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9870"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  datanode1:
+    <<: *hadoop
+    hostname: datanode1
+    command: ["hdfs", "datanode"]
     environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
+      WAITFOR: namenode:8020
+      HADOOP_HEAPSIZE_MAX: 256m
     volumes:
-      - ./data:/opt/project/data
-      - ./src:/opt/project/src
-      - ./conf:/opt/project/conf
+      - datanode1:/data/hdfs
+
+  datanode2:
+    <<: *hadoop
+    hostname: datanode2
+    command: ["hdfs", "datanode"]
+    environment:
+      WAITFOR: namenode:8020
+      HADOOP_HEAPSIZE_MAX: 256m
+    volumes:
+      - datanode2:/data/hdfs
+
+  datanode3:
+    <<: *hadoop
+    hostname: datanode3
+    command: ["hdfs", "datanode"]
+    environment:
+      WAITFOR: namenode:8020
+      HADOOP_HEAPSIZE_MAX: 256m
+    volumes:
+      - datanode3:/data/hdfs
+
+  # ---------- YARN (calcul) ----------
+  resourcemanager:
+    <<: *hadoop
+    hostname: resourcemanager
+    command: ["yarn", "resourcemanager"]
+    environment:
+      WAITFOR: namenode:8020
+      HADOOP_HEAPSIZE_MAX: 512m
+    ports:
+      - "8088:8088"   # interface web YARN
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8088"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  nodemanager1:
+    <<: *hadoop
+    hostname: nodemanager1
+    command: ["yarn", "nodemanager"]
+    environment:
+      WAITFOR: resourcemanager:8088
+      HADOOP_HEAPSIZE_MAX: 512m
+
+  nodemanager2:
+    <<: *hadoop
+    hostname: nodemanager2
+    command: ["yarn", "nodemanager"]
+    environment:
+      WAITFOR: resourcemanager:8088
+      HADOOP_HEAPSIZE_MAX: 512m
+
+  # ---------- Initialisation (s'exécute une fois puis s'arrête) ----------
+  hdfs-init:
+    <<: *hadoop
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - >-
+        hdfs dfsadmin -safemode wait &&
+        hdfs dfs -mkdir -p /spark-logs /tmp /user/hadoop &&
+        hdfs dfs -chmod 1777 /spark-logs /tmp &&
+        echo "HDFS initialise"
+    environment:
+      WAITFOR: namenode:8020
+    depends_on:
+      namenode:
+        condition: service_healthy
+
+  # ---------- Spark ----------
+  spark-history:
+    <<: *hadoop
+    hostname: spark-history
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    environment:
+      SPARK_DAEMON_MEMORY: 512m
+    ports:
+      - "18080:18080"   # interface web de l'historique Spark
+    volumes:
+      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+
+  spark-client:
+    <<: *hadoop
+    hostname: spark-client
+    command: ["sleep", "infinity"]
+    working_dir: /opt/project
+    volumes:
+      - .:/opt/project   # le dépôt Git (code, scripts, data) visible dans le conteneur
+      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+      resourcemanager:
+        condition: service_healthy
+
+volumes:
+  namenode:
+  datanode1:
+  datanode2:
+  datanode3:
