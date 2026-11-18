@@ -1,0 +1,9 @@
+# Les scripts et fichiers lus par Linux (dans les conteneurs) gardent des fins de
+# ligne Unix, même quand le dépôt est cloné sous Windows. Sans cela, bash échoue
+# avec des erreurs du type "$'\r': command not found".
+*.sh        text eol=lf
+*.env       text eol=lf
+*.conf      text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.py        text eol=lf
