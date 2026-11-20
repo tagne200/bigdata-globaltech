@@ -105,9 +105,13 @@ services:
         hdfs dfsadmin -safemode wait &&
         hdfs dfs -mkdir -p /spark-logs /tmp /user/hadoop &&
         hdfs dfs -chmod 1777 /spark-logs /tmp &&
+        bash /opt/project/scripts/hdfs_arborescence.sh &&
         echo "HDFS initialise"
     environment:
       WAITFOR: namenode:8020
+    volumes:
+      # Arborescence du projet (lot 2, BG-23), créée à chaque démarrage (script idempotent).
+      - ./scripts:/opt/project/scripts:ro
     depends_on:
       namenode:
         condition: service_healthy
