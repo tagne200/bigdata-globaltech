@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 from pyspark.sql import functions as F
 
-from src.silver.numbers import parse_price
+from src.silver.nombres import parse_price
 
 
 def _parse(spark, value):
