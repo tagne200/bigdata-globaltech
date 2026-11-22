@@ -1,10 +1,12 @@
 """Historisation des produits en SCD type 2 (ticket BG-32).
 
+
 Un produit peut avoir plusieurs versions (prix, famille). On garde TOUTES les versions,
 chacune avec sa période de validité :
 
     valid_from  date de la version (colonne updated_at de la source)
-    valid_to    veille de la version suivante, ou 9999-12-31 pour la version courante
+    valid_to    début de la version suivante (exclu), ou 9999-12-31 pour la version courante
+    Règle de jointure : valid_from <= order_ts < valid_to.
     is_current  True pour la dernière version de chaque produit
 
 Fusion des deltas (J2, J3) : on relit TOUT le bronze des produits à chaque exécution et on
@@ -89,7 +91,7 @@ def evaluer_produits(produits: DataFrame) -> DataFrame:
     cle_produit = F.when(retenue, F.col("_pid")).otherwise(F.concat(F.lit("x-"), F.col("_rid")))
     suivante = F.lead("_debut").over(Window.partitionBy(cle_produit).orderBy("_debut"))
     return (df.withColumn("_suivante", suivante)
-            .withColumn("valid_to", F.coalesce(F.date_sub(F.col("_suivante"), 1),
+            .withColumn("valid_to", F.coalesce(F.col("_suivante"),
                                                F.lit(DATE_FIN).cast("date")))
             .withColumn("is_current", F.col("_suivante").isNull())
             .drop("_rn", "_suivante"))
