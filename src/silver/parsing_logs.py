@@ -57,6 +57,7 @@ def parser_logs(df: DataFrame) -> DataFrame:
             # On les convertit avec le fuseau Europe/Paris configuré dans Spark.
             F.coalesce(
                 F.to_timestamp(
+                    F.col("date_brute"),
                     "dd/MMM/yyyy:HH:mm:ss Z"
                     ),
                 parse_order_ts(F.col("date_brute"))
