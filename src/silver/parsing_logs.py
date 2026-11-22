@@ -3,6 +3,7 @@
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
+from src.silver.dates import parse_order_ts
 
 
 # Expression régulière correspondant au format Apache Combined
@@ -52,10 +53,14 @@ def parser_logs(df: DataFrame) -> DataFrame:
         resultat
         .withColumn(
             "horodatage",
-            F.to_timestamp(
-                F.col("date_brute"),
-                "dd/MMM/yyyy:HH:mm:ss Z"
-            )
+            # Profilage J1, section 4 : 58 logs ont une date yyyy-MM-dd HH:mm:ss.
+            # On les convertit avec le fuseau Europe/Paris configuré dans Spark.
+            F.coalesce(
+                F.to_timestamp(
+                    "dd/MMM/yyyy:HH:mm:ss Z"
+                    ),
+                parse_order_ts(F.col("date_brute"))
+                )
         )
         .withColumn(
             "statut_http",
