@@ -4,7 +4,8 @@ import pytest
 from pyspark.sql import functions as F
 
 from src.silver.pays import normaliser_pays
-from src.silver.quality import evaluer_commandes, separer
+from src.silver.deduplication import marquer_doublons
+from src.silver.quality import evaluer_commandes, extraire_doublons, separer
 
 DDL = ("order_id string, order_ts string, customer_id string, product_id string, "
        "quantity string, unit_price_eur string, country string, warehouse_id string, "
@@ -59,6 +60,8 @@ def test_ligne_valide_est_propre_et_convertie(spark):
     ("product_id", "", "PRODUIT_ORPHELIN"),
     ("customer_id", "C999", "CLIENT_ORPHELIN"),
     ("customer_id", "", "CLIENT_ORPHELIN"),
+    ("status", "", "STATUT_INVALIDE"),
+    ("status", "PENDING", "STATUT_INVALIDE"),
 ])
 def test_un_defaut_donne_un_seul_motif(spark, champ, valeur, motif):
     assert _motifs(spark, **{champ: valeur}) == [motif]
@@ -109,3 +112,21 @@ def test_le_statut_est_normalise_en_silver(spark, brut, attendu):
     clients = spark.createDataFrame([("C1",)], "customer_id string")
     propres, _ = separer(evaluer_commandes(commandes, produits, clients, DEBUT, FIN), "run1")
     assert propres.first()["status"] == attendu
+
+
+def test_propres_plus_rejets_plus_doublons_egale_lignes_lues(spark):
+    lignes = [VALIDE,
+              {**VALIDE},                                        # doublon exact de la première
+              {**VALIDE, "order_id": "O2", "status": "SHIPPED"},
+              {**VALIDE, "order_id": "O2", "status": "CANCELLED"},   # garde O2, jette SHIPPED
+              {**VALIDE, "order_id": "O3", "quantity": "abc"},       # rejet
+              {**VALIDE, "order_id": "O4", "_corrupt_record": "x"}]  # rejet FORMAT_INVALIDE
+    commandes = spark.createDataFrame([tuple(l[c] for c in DDL_COLS) for l in lignes], DDL)
+    produits = spark.createDataFrame([("P1",)], "product_id string")
+    clients = spark.createDataFrame([("C1",)], "customer_id string")
+    evalue = evaluer_commandes(marquer_doublons(commandes), produits, clients, DEBUT, FIN)
+    propres, rejets = separer(evalue, "run1")
+    doublons = extraire_doublons(evalue)
+    assert (propres.count(), rejets.count(), doublons.count()) == (2, 2, 2)
+    assert propres.count() + rejets.count() + doublons.count() == commandes.count()
+    assert sorted(r["status"] for r in propres.collect()) == ["CANCELLED", "COMPLETED"]
