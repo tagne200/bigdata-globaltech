@@ -15,11 +15,16 @@ Motifs :
     PRIX_INVALIDE       prix non numérique, vide ou <= 0
     PRODUIT_ORPHELIN    product_id absent du référentiel produits
     CLIENT_ORPHELIN     customer_id absent du référentiel clients
+    STATUT_INVALIDE     statut vide ou hors SHIPPED, COMPLETED, RETURNED, CANCELLED
+
+Les doublons (colonne `_doublon`, voir deduplication.py) ne sont ni propres ni rejetés :
+ils sont comptés à part, pour que propres + rejets + doublons = lignes lues.
 """
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from src.silver.dates import parse_order_ts
+from src.silver.deduplication import rang_statut
 from src.silver.nombres import parse_price
 from src.silver.pays import normaliser_pays
 from src.silver.schemas import SILVER_COMMANDES, imposer_schema
@@ -70,6 +75,7 @@ def evaluer_commandes(commandes: DataFrame, produits: DataFrame, clients: DataFr
         ("PRIX_INVALIDE", prix.isNull() | (prix <= 0)),
         ("PRODUIT_ORPHELIN", F.col("_produit_connu").isNull()),
         ("CLIENT_ORPHELIN", F.col("_client_connu").isNull()),
+        ("STATUT_INVALIDE", rang_statut(F.col("status")) == 0),
     ]
     # when(cond, motif) vaut null si la règle est respectée : filter retire ces null.
     motifs_regles = F.filter(
@@ -86,9 +92,15 @@ def evaluer_commandes(commandes: DataFrame, produits: DataFrame, clients: DataFr
 
 
 def separer(evalue: DataFrame, run_id: str):
-    """Sépare les lignes propres (typées) et les rejets (avec motifs et ligne d'origine)."""
+    """Sépare les lignes propres (typées) et les rejets (avec motifs et ligne d'origine).
+
+    Les lignes marquées comme doublons sont exclues des deux : voir extraire_doublons.
+    """
+    if "_doublon" not in evalue.columns:
+        evalue = evalue.withColumn("_doublon", F.lit(None).cast("string"))
+    gardees = evalue.filter(F.col("_doublon").isNull())
     propres = imposer_schema(
-        evalue.filter(F.size("motifs") == 0).select(
+        gardees.filter(F.size("motifs") == 0).select(
             "order_id", F.col("_ts").alias("order_ts"), "customer_id", "product_id",
             F.col("_qte").alias("quantity"), F.col("_prix").alias("unit_price_eur"),
             F.col("_pays").alias("country"), "warehouse_id", "channel",
@@ -98,9 +110,16 @@ def separer(evalue: DataFrame, run_id: str):
             "livraison", "ingest_date"),
         SILVER_COMMANDES, colonnes_en_plus=["livraison", "ingest_date"])
 
-    rejets = evalue.filter(F.size("motifs") > 0).select(
+    rejets = gardees.filter(F.size("motifs") > 0).select(
         F.lit("commandes").alias("source"), "livraison", "ingest_date", "motifs",
         # la ligne telle qu'elle est arrivée en bronze : c'est la preuve du rejet
         F.to_json(F.struct(*COLONNES_METIER, "_corrupt_record")).alias("ligne_origine"),
         F.lit(run_id).alias("run_id"), F.current_timestamp().alias("rejete_le"))
     return propres, rejets
+
+
+def extraire_doublons(evalue: DataFrame) -> DataFrame:
+    """Les lignes écartées comme doublons ('EXACT' ou 'STATUT'), pour les compter."""
+    if "_doublon" not in evalue.columns:
+        return evalue.limit(0)
+    return evalue.filter(F.col("_doublon").isNotNull())

@@ -16,7 +16,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark import StorageLevel
 
-from src.silver.quality import evaluer_commandes, separer
+from src.silver.deduplication import marquer_doublons
+from src.silver.quality import evaluer_commandes, extraire_doublons, separer
 
 
 def bornes_du_mois(mois: str):
@@ -54,7 +55,8 @@ def main(argv=None):
     produits = lire_bronze(spark, f"{a.bronze}/produits")
     clients = lire_bronze(spark, f"{a.bronze}/clients")
 
-    evalue = evaluer_commandes(commandes, produits, clients, debut, fin)
+    # 1) on repère les doublons, 2) on contrôle la qualité des lignes restantes
+    evalue = evaluer_commandes(marquer_doublons(commandes), produits, clients, debut, fin)
     # persist : les deux sorties (propres, rejets) réutilisent le même calcul.
     evalue.persist(StorageLevel.MEMORY_AND_DISK)
     propres, rejets = separer(evalue, run_id)
@@ -62,6 +64,10 @@ def main(argv=None):
     lues = commandes.count()
     n_propres = propres.count()
     n_rejets = rejets.count()
+    doublons = extraire_doublons(evalue)
+    n_dbl_exacts = doublons.filter(F.col("_doublon") == "EXACT").count()
+    n_dbl_statut = doublons.filter(F.col("_doublon") == "STATUT").count()
+    n_doublons = n_dbl_exacts + n_dbl_statut
 
     propres.write.mode("overwrite").partitionBy("ingest_date").parquet(a.silver)
     rejets.write.mode("overwrite").partitionBy("livraison").parquet(a.rejets)
@@ -74,14 +80,16 @@ def main(argv=None):
     total_rejets = spark.read.parquet(a.rejets).count()
 
     print(f"BILAN commandes {a.livraison} run_id={run_id} periode=[{debut}, {fin}[ "
-          f"lues={lues} propres={n_propres} rejets={n_rejets} doublons=0 (BG-31) "
+          f"lues={lues} propres={n_propres} rejets={n_rejets} "
+          f"doublons={n_doublons} (exacts={n_dbl_exacts} statut={n_dbl_statut}) "
           f"ecrites={ecrites} total_silver={total_silver} total_rejets={total_rejets}")
     print("Motifs de rejet (une ligne peut en cumuler plusieurs) :")
     (rejets.select(F.explode("motifs").alias("motif")).groupBy("motif").count()
      .orderBy(F.desc("count")).show(truncate=False))
 
-    if lues != n_propres + n_rejets or ecrites != n_propres:
-        print("ERREUR : propres + rejets != lues, ou silver écrite != propres", file=sys.stderr)
+    if lues != n_propres + n_rejets + n_doublons or ecrites != n_propres:
+        print("ERREUR : propres + rejets + doublons != lues, ou silver écrite != propres",
+              file=sys.stderr)
         sys.exit(1)
     evalue.unpersist()
     spark.stop()
