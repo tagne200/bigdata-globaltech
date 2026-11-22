@@ -8,8 +8,10 @@ Deux familles de schémas :
   - RAW_*    : tout en texte (StringType). C'est ce qu'on lit depuis le CSV / la bronze.
                Lire en texte garantit qu'aucune ligne n'est perdue à la lecture.
   - SILVER_* : les types cibles, après nettoyage. La conversion texte -> type
-               est faite par dates.py et numbers.py.
+               est faite par dates.py et nombres.py.
 """
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DateType, DecimalType, IntegerType, StringType, StructField, StructType,
     TimestampType,
@@ -74,3 +76,13 @@ SILVER_CLIENTS = StructType([
     StructField("created_at", DateType(), True),
     StructField("updated_at", TimestampType(), True),
 ])
+
+
+def imposer_schema(df: DataFrame, schema: StructType, colonnes_en_plus=()) -> DataFrame:
+    """Force un DataFrame à respecter un schéma : mêmes colonnes, même ordre, mêmes types.
+
+    On sélectionne chaque colonne du schéma et on la convertit vers son type cible.
+    Les colonnes techniques à conserver (livraison, ingest_date...) se passent à part.
+    """
+    colonnes = [F.col(f.name).cast(f.dataType).alias(f.name) for f in schema.fields]
+    return df.select(*colonnes, *colonnes_en_plus)
