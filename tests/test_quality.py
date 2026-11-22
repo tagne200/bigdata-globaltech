@@ -97,3 +97,15 @@ def test_propres_plus_rejets_egale_lignes_lues(spark):
 def test_normalisation_des_pays(spark, brut, attendu):
     df = spark.createDataFrame([(brut,)], "raw string")
     assert df.select(normaliser_pays(F.col("raw")).alias("p")).first()["p"] == attendu
+
+
+@pytest.mark.parametrize("brut, attendu", [
+    ("completed", "COMPLETED"), (" Cancelled ", "CANCELLED"), ("SHIPPED", "SHIPPED"),
+])
+def test_le_statut_est_normalise_en_silver(spark, brut, attendu):
+    ligne = {**VALIDE, "status": brut}
+    commandes = spark.createDataFrame([tuple(ligne[c] for c in DDL_COLS)], DDL)
+    produits = spark.createDataFrame([("P1",)], "product_id string")
+    clients = spark.createDataFrame([("C1",)], "customer_id string")
+    propres, _ = separer(evaluer_commandes(commandes, produits, clients, DEBUT, FIN), "run1")
+    assert propres.first()["status"] == attendu

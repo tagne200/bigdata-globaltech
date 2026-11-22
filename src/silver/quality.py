@@ -91,7 +91,10 @@ def separer(evalue: DataFrame, run_id: str):
         evalue.filter(F.size("motifs") == 0).select(
             "order_id", F.col("_ts").alias("order_ts"), "customer_id", "product_id",
             F.col("_qte").alias("quantity"), F.col("_prix").alias("unit_price_eur"),
-            F.col("_pays").alias("country"), "warehouse_id", "channel", "status",
+            F.col("_pays").alias("country"), "warehouse_id", "channel",
+            # statut normalisé (trim + majuscules) : le CA de la gold exclut CANCELLED
+            # et BG-31 classe les statuts, donc "completed" doit devenir "COMPLETED"
+            F.upper(F.trim("status")).alias("status"),
             "livraison", "ingest_date"),
         SILVER_COMMANDES, colonnes_en_plus=["livraison", "ingest_date"])
 
