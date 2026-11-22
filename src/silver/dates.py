@@ -44,3 +44,11 @@ def parse_date(col: Column) -> Column:
     """Date simple 'yyyy-MM-dd' (updated_at des produits, created_at des clients)."""
     s = F.trim(col)
     return F.when(s.rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(s, "yyyy-MM-dd"))
+
+def parse_date_multi(col: Column) -> Column:
+    """Date simple en 'yyyy-MM-dd' ou 'dd/MM/yyyy' (created_at des clients), sinon null."""
+    s = F.trim(col)
+    return F.coalesce(
+        F.when(s.rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(s, "yyyy-MM-dd")),
+        F.when(s.rlike(r"^\d{2}/\d{2}/\d{4}$"), F.to_date(s, "dd/MM/yyyy")),
+    )
