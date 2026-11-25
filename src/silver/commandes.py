@@ -11,6 +11,8 @@ import argparse
 import sys
 import uuid
 from datetime import date
+from src.silver.evolution_schema import lire_livraison, aligner_schema
+from src.silver.schemas import RAW_COMMANDES
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -49,8 +51,24 @@ def main(argv=None):
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
     run_id = uuid.uuid4().hex[:12]
     debut, fin = bornes_du_mois(a.mois)
-
-    commandes = lire_bronze(spark, f"{a.bronze}/commandes", a.livraison)
+    commandes_brutes = lire_livraison(
+        spark,
+        f"{a.bronze}/commandes",
+        a.livraison
+    )
+    # Comparer les colonnes reçues aux 10 colonnes métier attendues.
+    commandes, differences = aligner_schema(
+        commandes_brutes,
+        RAW_COMMANDES.fieldNames()
+    )
+    # Afficher les évolutions de schéma pour la traçabilité.
+    print(
+        f"SCHEMA commandes {a.livraison} "
+        f"colonnes_ajoutees={differences['colonnes_ajoutees']} "
+        f"colonnes_retirees={differences['colonnes_retirees']} "
+        f"colonnes_renommees={differences['colonnes_renommees']}",
+        flush=True
+    )
     # Référentiels : toutes les livraisons déjà chargées (clés connues à ce jour).
     produits = lire_bronze(spark, f"{a.bronze}/produits")
     clients = lire_bronze(spark, f"{a.bronze}/clients")
