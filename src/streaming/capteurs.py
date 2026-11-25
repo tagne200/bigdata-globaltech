@@ -1,13 +1,17 @@
 """Flux des capteurs avec Spark Structured Streaming (lot 5).
 
-BG-42 (ce fichier, étape 1) : LIRE le flux déposé par tools/stream_replay.py dans
-/data/landing/capteurs, typer les événements et repérer les lignes invalides.
-Les étapes suivantes s'ajoutent ici : watermark, déduplication et fenêtres (BG-43),
-alertes (BG-44), écriture idempotente et reprise (BG-45).
+Étapes du flux, une par ticket :
+  BG-42  LIRE le flux déposé par tools/stream_replay.py dans /data/landing/capteurs,
+         typer les événements et repérer les lignes invalides ;
+  BG-43  WATERMARK de 6 minutes, DÉDUPLICATION des event_id, AGRÉGATS par fenêtre de 1 min ;
+  BG-44  alertes sur seuils (à venir) ;
+  BG-45  écriture idempotente et reprise après arrêt (à venir).
 
 Lancement (dans le conteneur spark-client, le job part sur YARN) :
-    # traite tous les fichiers déjà présents puis s'arrête (démonstration, tests)
+    # fenêtres (défaut) : traite les fichiers déjà présents puis s'arrête
     spark-submit src/streaming/capteurs.py --disponible
+    # contrôle de la lecture seule (BG-42)
+    spark-submit src/streaming/capteurs.py --etape lecture --disponible
     # flux continu, arrêt automatique au bout de 120 s
     spark-submit src/streaming/capteurs.py --duree 120
 
@@ -32,6 +36,14 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
 COLONNE_CORROMPUE = "_corrupt_record"
+
+# BG-43. Retard maximal mesuré sur J1 : 300 s (heure de l'événement -> heure du fichier).
+# Le watermark doit être STRICTEMENT plus grand, sinon les événements les plus en retard
+# sont écartés sans bruit. 6 min = 300 s mesurés + 1 min de marge.
+WATERMARK = "6 minutes"
+# 180 capteurs envoient chacun ~6 mesures par minute : une fenêtre de 1 min contient
+# assez de points pour une moyenne utile, et reste assez courte pour réagir vite.
+TAILLE_FENETRE = "1 minute"
 
 # Métriques connues et unités attendues (README du kit, profilage J1).
 # Attention : la pression s'appelle "pression", pas "pressure".
@@ -101,6 +113,49 @@ def preparer_evenements(df: DataFrame) -> DataFrame:
     return df.withColumn("motifs", motifs)
 
 
+def evenements_valides(df: DataFrame) -> DataFrame:
+    """Ne garde que les événements sans motif de rejet."""
+    return df.filter(F.size("motifs") == 0)
+
+
+def dedoublonner(df: DataFrame, watermark: str = WATERMARK) -> DataFrame:
+    """Watermark + suppression des event_id renvoyés (BG-43).
+
+    - withWatermark : Spark garde en mémoire les événements récents tant que l'horloge
+      des événements n'a pas dépassé « heure max vue - 6 min ». Au-delà, un événement
+      plus ancien est considéré trop tard et écarté (compté dans les métriques).
+    - dropDuplicatesWithinWatermark (Spark 3.5) : garde le premier event_id vu et oublie
+      la clé une fois le watermark passé. Avec dropDuplicates classique, il faudrait mettre
+      l'heure dans la clé ; un même event_id renvoyé à une autre heure ne serait plus
+      reconnu (mesuré sur J1 : 201 event_id en double, tous avec la même heure).
+    dropDuplicatesWithinWatermark n'existe qu'en streaming : sur un DataFrame batch (tests,
+    contrôle de référence), on applique dropDuplicates, qui donne le même résultat.
+    """
+    if not df.isStreaming:
+        return df.dropDuplicates(["event_id"])
+    return df.withWatermark("horodatage", watermark).dropDuplicatesWithinWatermark(["event_id"])
+
+
+def agreger_par_fenetre(df: DataFrame, taille: str = TAILLE_FENETRE) -> DataFrame:
+    """Agrégats par capteur et par fenêtre fixe (tumbling) de 1 minute (BG-43).
+
+    En mode append, une fenêtre n'est écrite qu'UNE fois, quand le watermark a dépassé sa
+    fin : son résultat est alors définitif (aucun événement tardif ne peut plus la modifier).
+    """
+    return (
+        df.groupBy(F.window("horodatage", taille).alias("fenetre"),
+                   "site", "country", "machine_id", "sensor_id", "metrique", "unit")
+        .agg(F.count(F.lit(1)).alias("nb_mesures"),
+             F.round(F.avg("valeur"), 3).alias("valeur_moyenne"),
+             F.min("valeur").alias("valeur_min"),
+             F.max("valeur").alias("valeur_max"))
+        .select(F.col("fenetre.start").alias("debut_fenetre"),
+                F.col("fenetre.end").alias("fin_fenetre"),
+                "site", "country", "machine_id", "sensor_id", "metrique", "unit",
+                "nb_mesures", "valeur_moyenne", "valeur_min", "valeur_max")
+    )
+
+
 def bilan_du_lot(lot: DataFrame, id_lot: int) -> dict:
     """Comptages d'un micro-lot : lus, valides, invalides et détail par motif."""
     lignes = lot.select(F.size("motifs").alias("n"), "motifs").groupBy().agg(
@@ -124,11 +179,35 @@ def afficher_bilan(lot: DataFrame, id_lot: int) -> None:
     print("BILAN capteurs " + " ".join(f"{k}={v}" for k, v in bilan.items()), flush=True)
 
 
+def afficher_fenetres(lot: DataFrame, id_lot: int) -> None:
+    """Une ligne FENETRES par micro-lot : fenêtres devenues définitives dans ce lot."""
+    # Heures formatées PAR SPARK (fuseau de session Europe/Paris). Un collect() les
+    # convertirait dans le fuseau du conteneur (UTC) : 07:00 affiché au lieu de 08:00.
+    r = lot.agg(F.count(F.lit(1)).alias("fenetres"), F.sum("nb_mesures").alias("mesures"),
+                F.date_format(F.min("debut_fenetre"), "HH:mm").alias("de"),
+                F.date_format(F.max("fin_fenetre"), "HH:mm").alias("a")).first()
+    if r["fenetres"]:
+        print(f"FENETRES capteurs lot={id_lot} fenetres={r['fenetres']} mesures={r['mesures']} "
+              f"de={r['de']} a={r['a']}", flush=True)
+    else:
+        print(f"FENETRES capteurs lot={id_lot} fenetres=0 (watermark pas encore dépassé)",
+              flush=True)
+
+
+def lignes_ecartees_par_le_watermark(requete) -> int:
+    """Somme des événements jugés trop en retard (métrique Spark numRowsDroppedByWatermark)."""
+    return sum(op.get("numRowsDroppedByWatermark", 0)
+               for p in requete.recentProgress for op in p.get("stateOperators", []))
+
+
 def analyser_arguments(argv=None):
-    p = argparse.ArgumentParser(description="Lecture du flux capteurs (BG-42)")
+    p = argparse.ArgumentParser(description="Flux capteurs (BG-42 lecture, BG-43 fenêtres)")
+    p.add_argument("--etape", choices=("lecture", "fenetres"), default="fenetres",
+                   help="lecture : contrôle des lignes (BG-42) ; fenetres : agrégats (BG-43)")
     p.add_argument("--landing", default="/data/landing/capteurs")
-    p.add_argument("--checkpoint", default="/checkpoints/capteurs/lecture",
-                   help="état du flux (fichiers déjà lus), pour reprendre après un arrêt")
+    p.add_argument("--checkpoint", default=None,
+                   help="état du flux (défaut : /checkpoints/capteurs/<etape>)")
+    p.add_argument("--watermark", default=WATERMARK, help="retard toléré (défaut 6 minutes)")
     p.add_argument("--max-fichiers", type=int, default=12, help="fichiers max par micro-lot")
     p.add_argument("--intervalle", default="10 seconds", help="déclenchement des micro-lots")
     groupe = p.add_mutually_exclusive_group()
@@ -136,19 +215,27 @@ def analyser_arguments(argv=None):
                         help="traiter les fichiers déjà présents puis s'arrêter")
     groupe.add_argument("--duree", type=int, default=0,
                         help="arrêter le flux au bout de N secondes (0 = jamais)")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    args.checkpoint = args.checkpoint or f"/checkpoints/capteurs/{args.etape}"
+    return args
 
 
 def main(argv=None) -> int:
     args = analyser_arguments(argv)
-    spark = (SparkSession.builder.appName("streaming-capteurs-lecture")
+    spark = (SparkSession.builder.appName(f"streaming-capteurs-{args.etape}")
              .config("spark.ui.showConsoleProgress", "false")
              .getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
 
     evenements = preparer_evenements(lire_flux(spark, args.landing, args.max_fichiers))
-    ecriture = (evenements.writeStream
-                .foreachBatch(afficher_bilan)
+    if args.etape == "lecture":
+        flux, traiter = evenements, afficher_bilan
+    else:
+        flux = agreger_par_fenetre(dedoublonner(evenements_valides(evenements), args.watermark))
+        traiter = afficher_fenetres
+    ecriture = (flux.writeStream
+                .outputMode("append")
+                .foreachBatch(traiter)
                 .option("checkpointLocation", args.checkpoint))
     ecriture = (ecriture.trigger(availableNow=True) if args.disponible
                 else ecriture.trigger(processingTime=args.intervalle))
@@ -162,6 +249,10 @@ def main(argv=None) -> int:
     else:
         requete.awaitTermination()
 
+    if args.etape == "fenetres":
+        print(f"WATERMARK capteurs retard_tolere={args.watermark} "
+              f"evenements_ecartes_en_retard={lignes_ecartees_par_le_watermark(requete)}",
+              flush=True)
     spark.stop()
     return 0
 

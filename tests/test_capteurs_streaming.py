@@ -1,8 +1,9 @@
 """Tests de la lecture du flux capteurs (BG-42)."""
-import datetime as dt
 import json
+import os
 
 import pytest
+from pyspark.sql import functions as F
 
 from src.streaming.capteurs import (SCHEMA_CAPTEURS, bilan_du_lot, lire_flux,
                                     preparer_evenements)
@@ -21,7 +22,11 @@ def preparer(spark, tmp_path, lignes):
     fichier.write_text("\n".join(lignes) + "\n", encoding="utf-8")
     brut = (spark.read.schema(SCHEMA_CAPTEURS).option("mode", "PERMISSIVE")
             .option("columnNameOfCorruptRecord", "_corrupt_record").json(str(fichier)))
-    return preparer_evenements(brut).collect()
+    # Heure formatée par Spark (fuseau de session Europe/Paris) : un datetime récupéré par
+    # collect() dépendrait du fuseau de la machine qui lance les tests (UTC en CI).
+    return (preparer_evenements(brut)
+            .withColumn("heure", F.date_format("horodatage", "yyyy-MM-dd HH:mm:ss.SSS"))
+            .collect())
 
 
 def test_evenement_valide(spark, tmp_path):
@@ -29,7 +34,7 @@ def test_evenement_valide(spark, tmp_path):
     assert ligne["motifs"] == []
     assert ligne["valeur"] == pytest.approx(58.14)
     # +01:00 dans la source = 08:00:02 à Paris (fuseau de la session de test)
-    assert ligne["horodatage"] == dt.datetime(2026, 1, 31, 8, 0, 2, 110000)
+    assert ligne["heure"] == "2026-01-31 08:00:02.110"
 
 
 def test_valeur_envoyee_en_texte_est_gardee(spark, tmp_path):
@@ -99,3 +104,96 @@ def test_le_flux_ignore_les_fichiers_en_cours_de_copie(spark, tmp_path):
                .trigger(availableNow=True).start())
     requete.awaitTermination()
     assert vus == ["A"]
+
+
+# ---------------------------------------------------------------- BG-43 : déduplication et fenêtres
+
+from src.streaming.capteurs import (agreger_par_fenetre, dedoublonner,  # noqa: E402
+                                    evenements_valides, lignes_ecartees_par_le_watermark)
+
+
+def lire_batch(spark, tmp_path, lignes, nom="lot.jsonl"):
+    fichier = tmp_path / nom
+    fichier.write_text("\n".join(lignes) + "\n", encoding="utf-8")
+    return preparer_evenements(spark.read.schema(SCHEMA_CAPTEURS).option("mode", "PERMISSIVE")
+                               .option("columnNameOfCorruptRecord", "_corrupt_record")
+                               .json(str(fichier)))
+
+
+def test_un_event_id_renvoye_n_est_compte_qu_une_fois(spark, tmp_path):
+    df = lire_batch(spark, tmp_path, [evenement(event_id="A"), evenement(event_id="A"),
+                                      evenement(event_id="B")])
+    assert dedoublonner(evenements_valides(df)).count() == 2
+
+
+def test_les_evenements_invalides_n_entrent_pas_dans_les_fenetres(spark, tmp_path):
+    df = lire_batch(spark, tmp_path, [evenement(event_id="A"), evenement(event_id="B", value=None)])
+    assert evenements_valides(df).count() == 1
+
+
+def test_agregats_d_une_fenetre_d_une_minute(spark, tmp_path):
+    df = lire_batch(spark, tmp_path, [
+        evenement(event_id="A", value=10, event_time="2026-01-31T08:00:10+01:00"),
+        evenement(event_id="B", value=20, event_time="2026-01-31T08:00:50+01:00"),
+        evenement(event_id="C", value=99, event_time="2026-01-31T08:01:05+01:00"),  # minute suivante
+    ])
+    fenetres = {r["debut"]: r for r in agreger_par_fenetre(dedoublonner(evenements_valides(df)))
+                .withColumn("debut", F.date_format("debut_fenetre", "HH:mm"))
+                .withColumn("fin", F.date_format("fin_fenetre", "HH:mm")).collect()}
+    assert sorted(fenetres) == ["08:00", "08:01"]
+    f = fenetres["08:00"]
+    assert (f["nb_mesures"], f["valeur_moyenne"], f["valeur_min"], f["valeur_max"]) == (2, 15.0, 10, 20)
+    assert f["fin"] == "08:01"
+
+
+def test_flux_watermark_deduplication_et_retard(spark, tmp_path):
+    """Scénario en streaming, un fichier par micro-lot :
+    lot 0 : A (08:00:10), A renvoyé, B (08:00:40)   -> une fenêtre 08:00 en attente
+    lot 1 : C (08:10:00)                             -> watermark = 08:10 - 6 min = 08:04
+    lot 2 : E (08:11:00)                             -> la fenêtre 08:00 devient définitive
+    lot 3 : D (08:00:30), arrivé beaucoup trop tard  -> écarté par le watermark
+    Attendu : la fenêtre 08:00 est écrite UNE fois, avec 2 mesures (A et B, A dédoublonné),
+    et D est compté comme écarté. Les fenêtres 08:10 et 08:11 ne sont pas encore définitives.
+
+    Subtilité mesurée (Spark 3.5, deux opérateurs à état enchaînés) : le filtre des événements
+    en retard utilise le watermark du lot PRÉCÉDENT. Un événement tardif qui arrive dans le
+    lot qui suit immédiatement la montée du watermark est donc encore accepté : la tolérance
+    réelle est un peu plus large que 6 min, jamais plus courte. D'où le lot 2 intermédiaire.
+    """
+    landing = tmp_path / "landing"
+    landing.mkdir()
+    (landing / "capteurs_1.jsonl").write_text("\n".join([
+        evenement(event_id="A", value=10, event_time="2026-01-31T08:00:10+01:00"),
+        evenement(event_id="A", value=10, event_time="2026-01-31T08:00:10+01:00"),
+        evenement(event_id="B", value=20, event_time="2026-01-31T08:00:40+01:00"),
+    ]) + "\n", encoding="utf-8")
+    (landing / "capteurs_2.jsonl").write_text(
+        evenement(event_id="C", value=5, event_time="2026-01-31T08:10:00+01:00") + "\n",
+        encoding="utf-8")
+    (landing / "capteurs_3.jsonl").write_text(
+        evenement(event_id="E", value=7, event_time="2026-01-31T08:11:00+01:00") + "\n",
+        encoding="utf-8")
+    (landing / "capteurs_4.jsonl").write_text(
+        evenement(event_id="D", value=30, event_time="2026-01-31T08:00:30+01:00") + "\n",
+        encoding="utf-8")
+
+    # La source fichier traite les fichiers par date de modification : on l'impose,
+    # sinon trois fichiers écrits dans la même milliseconde peuvent être lus dans le désordre.
+    for i, nom in enumerate(["capteurs_1.jsonl", "capteurs_2.jsonl", "capteurs_3.jsonl",
+                           "capteurs_4.jsonl"]):
+        os.utime(landing / nom, (1_000_000 + i * 60, 1_000_000 + i * 60))
+
+    ecrites = []
+
+    def collecter(lot, _id):
+        ecrites.extend(lot.withColumn("debut", F.date_format("debut_fenetre", "HH:mm")).collect())
+
+    flux = agreger_par_fenetre(dedoublonner(evenements_valides(
+        preparer_evenements(lire_flux(spark, str(landing), max_fichiers=1)))))
+    requete = (flux.writeStream.outputMode("append").foreachBatch(collecter)
+               .option("checkpointLocation", str(tmp_path / "checkpoint"))
+               .trigger(availableNow=True).start())
+    requete.awaitTermination()
+
+    assert [(r["debut"], r["nb_mesures"], r["valeur_moyenne"]) for r in ecrites] == [("08:00", 2, 15.0)]
+    assert lignes_ecartees_par_le_watermark(requete) == 1
